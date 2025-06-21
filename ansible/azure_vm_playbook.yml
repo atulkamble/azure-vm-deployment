@@ -1,0 +1,14 @@
+- hosts: localhost
+  tasks:
+    - name: Create Azure VM
+      azure_rm_virtualmachine:
+        resource_group: "MyResourceGroup"
+        name: "myVM"
+        vm_size: "Standard_DS1_v2"
+        admin_username: "azureuser"
+        admin_password: "Password123!"
+        image:
+          offer: UbuntuServer
+          publisher: Canonical
+          sku: '18.04-LTS'
+          version: latest

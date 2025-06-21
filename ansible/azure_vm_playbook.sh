@@ -1,0 +1,1 @@
+ansible-playbook azure_vm_playbook.yml
