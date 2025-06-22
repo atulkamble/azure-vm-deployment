@@ -1,4 +1,4 @@
-Great — let’s neatly organize **Azure VM management commands** using **Azure CLI** and **Azure PowerShell**, as these are the two most common interfaces for Azure VM operations.
+**Azure VM management commands** using **Azure CLI** and **Azure PowerShell**, as these are the two most common interfaces for Azure VM operations.
 
 ---
 
@@ -130,9 +130,3 @@ Get-AzPublicIpAddress -ResourceGroupName "myResourceGroup" | Select Name, IpAddr
 ```
 
 ---
-
-## 📌 Bonus — Azure ARM Template / Bicep / Terraform also possible for infra as code deployments. If you want, I can draft examples for those too.
-
----
-
-Would you like me to bundle this into a shell script or automation pipeline? Or perhaps a Terraform/Bicep version? 🚀
