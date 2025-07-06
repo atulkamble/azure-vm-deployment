@@ -33,6 +33,15 @@ az vm create \
   --admin-username azureuser \
   --generate-ssh-keys
 ```
+```
+az vm create \
+  --resource-group LAMP-ResourceGroup \
+  --name LampVM \
+  --image Ubuntu2404 \
+  --admin-username atul \
+  --generate-ssh-keys \
+  --size Standard_B1s
+```
 
 ---
 
