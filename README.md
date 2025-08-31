@@ -346,4 +346,688 @@ vm = compute_client.virtual_machines.begin_create_or_update(
 
 ## ✅ Conclusion
 
+Awesome brief, Atul! Here’s a clean, ready-to-reuse “all the common ways” toolkit to launch Azure VMs — Linux & Windows — using **Azure CLI**, **Azure PowerShell (Az)**, **Bicep**, **ARM JSON**, **Terraform**, and common **provisioning hooks** (cloud-init, Custom Script Extension). I’ve organized it with reusable variables, then variations (Spot, Availability Set, Zones, Accelerated Networking, Ephemeral OS, SIG image, VMSS, data disks, WinRM/RDP NSG, etc.).
+
+If you want, I can drop this into a GitHub-friendly repo layout next.
+
+---
+
+# 0) Reusable naming & variables (copy/paste once)
+
+### Azure CLI (bash/zsh)
+
+```bash
+# ---------- BASICS ----------
+export LOC="eastus"
+export RG="rg-vm-lab"
+export VNET="vnet-lab"
+export SUBNET="snet-app"
+export NSG="nsg-app"
+export PUBIP="pip-app"
+export NIC="nic-app-01"
+export TAGS="env=lab project=vm-lab owner=atul"
+
+# ---------- LINUX ----------
+export LINUX_VM="vm-ubuntu-01"
+export LINUX_IMAGE="Ubuntu2204"   # az vm image list --publisher Canonical --offer 0001-com-ubuntu-server-jammy ...
+export LINUX_SIZE="Standard_B2s"
+export SSH_KEY="$HOME/.ssh/azure_vm_lab_id_rsa.pub"  # create via: ssh-keygen -t ed25519 -f ~/.ssh/azure_vm_lab_id_rsa -N ''
+
+# ---------- WINDOWS ----------
+export WIN_VM="vm-win-01"
+export WIN_IMAGE="Win2022Datacenter"   # lookup with 'az vm image list --publisher MicrosoftWindowsServer --all -o table'
+export WIN_SIZE="Standard_B2ms"
+export ADMIN_USER="azureuser"
+export ADMIN_PASS='P@ssw0rd-Your-Strong-Password-123!'  # demo; prefer Key Vault + secrets in real use
+```
+
+### Azure PowerShell (pwsh)
+
+```powershell
+$Loc      = "eastus"
+$Rg       = "rg-vm-lab"
+$Vnet     = "vnet-lab"
+$Subnet   = "snet-app"
+$Nsg      = "nsg-app"
+$Pip      = "pip-app"
+$Nic      = "nic-app-01"
+$Tags     = @{ env="lab"; project="vm-lab"; owner="atul" }
+
+$LinuxVm  = "vm-ubuntu-01"
+$LinuxSz  = "Standard_B2s"
+$LinuxImg = "Canonical:0001-com-ubuntu-server-jammy:22_04-lts:latest"
+$SshKey   = Get-Content "$HOME/.ssh/azure_vm_lab_id_rsa.pub"
+
+$WinVm    = "vm-win-01"
+$WinSz    = "Standard_B2ms"
+$WinImg   = "MicrosoftWindowsServer:WindowsServer:2022-datacenter:latest"
+$Admin    = "azureuser"
+$Pass     = ConvertTo-SecureString "P@ssw0rd-Your-Strong-Password-123!" -AsPlainText -Force
+$Cred     = New-Object System.Management.Automation.PSCredential ($Admin, $Pass)
+```
+
+---
+
+# 1) Network & RG bootstrap (shared)
+
+### Azure CLI
+
+```bash
+az group create -n $RG -l $LOC
+
+az network vnet create -g $RG -n $VNET --address-prefixes 10.10.0.0/16 \
+  --subnet-name $SUBNET --subnet-prefixes 10.10.1.0/24
+
+az network nsg create -g $RG -n $NSG
+# Linux SSH + Web demo
+az network nsg rule create -g $RG --nsg-name $NSG -n allow-ssh --priority 1001 \
+  --access Allow --protocol Tcp --direction Inbound --source-address-prefixes '*' \
+  --source-port-ranges '*' --destination-port-ranges 22
+az network nsg rule create -g $RG --nsg-name $NSG -n allow-http --priority 1002 \
+  --access Allow --protocol Tcp --direction Inbound --destination-port-ranges 80
+
+az network public-ip create -g $RG -n $PUBIP --sku Standard --version IPv4
+
+az network nic create -g $RG -n $NIC --vnet-name $VNET --subnet $SUBNET \
+  --network-security-group $NSG --public-ip-address $PUBIP
+```
+
+### PowerShell
+
+```powershell
+New-AzResourceGroup -Name $Rg -Location $Loc
+
+$vnet = New-AzVirtualNetwork -Name $Vnet -ResourceGroupName $Rg -Location $Loc -AddressPrefix "10.10.0.0/16"
+Add-AzVirtualNetworkSubnetConfig -Name $Subnet -AddressPrefix "10.10.1.0/24" -VirtualNetwork $vnet | Set-AzVirtualNetwork
+
+$nsg = New-AzNetworkSecurityGroup -Name $Nsg -ResourceGroupName $Rg -Location $Loc
+New-AzNetworkSecurityRuleConfig -Name "allow-ssh" -NetworkSecurityGroup $nsg `
+  -Protocol Tcp -Direction Inbound -Priority 1001 -SourceAddressPrefix * -SourcePortRange * -DestinationPortRange 22 -Access Allow | Out-Null
+New-AzNetworkSecurityRuleConfig -Name "allow-http" -NetworkSecurityGroup $nsg `
+  -Protocol Tcp -Direction Inbound -Priority 1002 -SourceAddressPrefix * -SourcePortRange * -DestinationPortRange 80 -Access Allow | Out-Null
+$nsg | Set-AzNetworkSecurityGroup
+
+$pip = New-AzPublicIpAddress -Name $Pip -ResourceGroupName $Rg -Location $Loc -AllocationMethod Static -Sku Standard
+$subnetRef = (Get-AzVirtualNetwork -Name $Vnet -ResourceGroupName $Rg).Subnets | Where-Object {$_.Name -eq $Subnet}
+$nic = New-AzNetworkInterface -Name $Nic -ResourceGroupName $Rg -Location $Loc -SubnetId $subnetRef.Id -PublicIpAddressId $pip.Id -NetworkSecurityGroupId $nsg.Id
+```
+
+---
+
+# 2) Create a **Linux VM** (Ubuntu) — multiple ways
+
+### 2.1 Azure CLI (SSH key, cloud-init, tags)
+
+`cloud-init.yaml` (install Docker + NGINX demo)
+
+```yaml
+#cloud-config
+package_update: true
+packages:
+  - docker.io
+  - nginx
+runcmd:
+  - systemctl enable --now docker
+  - bash -lc "echo 'hello from cloud-init' > /var/www/html/index.nginx-debian.html"
+```
+
+```bash
+az vm create -g $RG -n $LINUX_VM \
+  --image "Canonical:0001-com-ubuntu-server-jammy:22_04-lts:latest" \
+  --size $LINUX_SIZE \
+  --admin-username azureuser \
+  --ssh-key-values "$SSH_KEY" \
+  --nics $NIC \
+  --custom-data cloud-init.yaml \
+  --tags $TAGS
+```
+
+### 2.2 PowerShell
+
+```powershell
+$vmCfg = New-AzVMConfig -VMName $LinuxVm -VMSize $LinuxSz |
+  Set-AzVMOperatingSystem -Linux -ComputerName $LinuxVm -Credential (New-Object PSCredential("azureuser",(ConvertTo-SecureString "ignored" -AsPlainText -Force))) -DisablePasswordAuthentication |
+  Set-AzVMSourceImage -PublisherName "Canonical" -Offer "0001-com-ubuntu-server-jammy" -Skus "22_04-lts" -Version "latest" |
+  Add-AzVMNetworkInterface -Id $nic.Id
+
+# SSH public key
+Add-AzVMSshPublicKey -VM $vmCfg -KeyData $SshKey -Path "/home/azureuser/.ssh/authorized_keys"
+
+# Cloud-init
+$ci = Get-Content "./cloud-init.yaml" -Raw
+Set-AzVMCustomData -VM $vmCfg -CustomData $ci
+
+New-AzVM -ResourceGroupName $Rg -Location $Loc -VM $vmCfg -Tag $Tags
+```
+
+### 2.3 Bicep (`main.bicep`)
+
+```bicep
+param location string = resourceGroup().location
+param vmName string = 'vm-ubuntu-01'
+param adminUser string = 'azureuser'
+@secure()
+param sshPubKey string
+param vnetName string
+param subnetName string
+param nsgName string
+
+resource nic 'Microsoft.Network/networkInterfaces@2023-11-01' existing = {
+  name: 'nic-app-01' // or create inside template
+}
+
+resource vm 'Microsoft.Compute/virtualMachines@2023-09-01' = {
+  name: vmName
+  location: location
+  tags: { env: 'lab', project: 'vm-lab', owner: 'atul' }
+  properties: {
+    hardwareProfile: { vmSize: 'Standard_B2s' }
+    osProfile: {
+      computerName: vmName
+      adminUsername: adminUser
+      linuxConfiguration: {
+        disablePasswordAuthentication: true
+        ssh: {
+          publicKeys: [
+            {
+              path: '/home/${adminUser}/.ssh/authorized_keys'
+              keyData: sshPubKey
+            }
+          ]
+        }
+      }
+      customData: base64(loadTextContent('cloud-init.yaml'))
+    }
+    storageProfile: {
+      imageReference: {
+        publisher: 'Canonical'
+        offer: '0001-com-ubuntu-server-jammy'
+        sku: '22_04-lts'
+        version: 'latest'
+      }
+      osDisk: {
+        createOption: 'FromImage'
+        managedDisk: { storageAccountType: 'Premium_LRS' }
+        diskSizeGB: 64
+      }
+    }
+    networkProfile: {
+      networkInterfaces: [
+        { id: nic.id }
+      ]
+    }
+  }
+}
+```
+
+### 2.4 ARM JSON (minimal Linux)
+
+```json
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "adminUsername": { "type": "string" },
+    "sshPubKey": { "type": "string" }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2023-09-01",
+      "name": "vm-ubuntu-01",
+      "location": "[resourceGroup().location]",
+      "properties": {
+        "hardwareProfile": { "vmSize": "Standard_B2s" },
+        "osProfile": {
+          "computerName": "vm-ubuntu-01",
+          "adminUsername": "[parameters('adminUsername')]",
+          "linuxConfiguration": {
+            "disablePasswordAuthentication": true,
+            "ssh": {
+              "publicKeys": [
+                {
+                  "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
+                  "keyData": "[parameters('sshPubKey')]"
+                }
+              ]
+            }
+          },
+          "customData": "[base64(loadTextContent('cloud-init.yaml'))]"
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "Canonical",
+            "offer": "0001-com-ubuntu-server-jammy",
+            "sku": "22_04-lts",
+            "version": "latest"
+          },
+          "osDisk": {
+            "createOption": "FromImage",
+            "managedDisk": { "storageAccountType": "Premium_LRS" },
+            "diskSizeGB": 64
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            { "id": "[resourceId('Microsoft.Network/networkInterfaces','nic-app-01')]" }
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+### 2.5 Terraform (Linux + cloud-init)
+
+`main.tf`
+
+```hcl
+terraform {
+  required_version = ">= 1.6"
+  required_providers { azurerm = { source = "hashicorp/azurerm" version = "~> 3.114" } }
+}
+provider "azurerm" { features {} }
+
+variable "location" { default = "eastus" }
+variable "rg"       { default = "rg-vm-lab" }
+
+data "template_file" "cloud_init" {
+  template = file("${path.module}/cloud-init.yaml")
+}
+
+resource "azurerm_resource_group" "rg" {
+  name     = var.rg
+  location = var.location
+  tags     = { env = "lab", project = "vm-lab", owner = "atul" }
+}
+
+resource "azurerm_virtual_network" "vnet" {
+  name                = "vnet-lab"
+  address_space       = ["10.10.0.0/16"]
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+}
+
+resource "azurerm_subnet" "subnet" {
+  name                 = "snet-app"
+  resource_group_name  = azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.10.1.0/24"]
+}
+
+resource "azurerm_network_security_group" "nsg" {
+  name                = "nsg-app"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  security_rule {
+    name                       = "ssh"
+    priority                   = 1001
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "22"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
+  security_rule {
+    name                       = "http"
+    priority                   = 1002
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "80"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
+}
+
+resource "azurerm_public_ip" "pip" {
+  name                = "pip-app"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+}
+
+resource "azurerm_network_interface" "nic" {
+  name                = "nic-app-01"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  ip_configuration {
+    name                          = "ipcfg"
+    subnet_id                     = azurerm_subnet.subnet.id
+    private_ip_address_allocation = "Dynamic"
+    public_ip_address_id          = azurerm_public_ip.pip.id
+  }
+  network_security_group_id = azurerm_network_security_group.nsg.id
+}
+
+resource "azurerm_linux_virtual_machine" "vm" {
+  name                = "vm-ubuntu-01"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  size                = "Standard_B2s"
+  admin_username      = "azureuser"
+  network_interface_ids = [azurerm_network_interface.nic.id]
+
+  admin_ssh_key {
+    username   = "azureuser"
+    public_key = file("~/.ssh/azure_vm_lab_id_rsa.pub")
+  }
+
+  custom_data = base64encode(data.template_file.cloud_init.rendered)
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-jammy"
+    sku       = "22_04-lts"
+    version   = "latest"
+  }
+
+  os_disk {
+    name                 = "osdisk-ubuntu01"
+    caching              = "ReadWrite"
+    storage_account_type = "Premium_LRS"
+    disk_size_gb         = 64
+  }
+
+  tags = { env = "lab", project = "vm-lab", owner = "atul" }
+}
+```
+
+---
+
+# 3) Create a **Windows VM** — multiple ways
+
+### 3.1 Azure CLI (RDP NSG rule + Custom Script to install IIS)
+
+`win-init.ps1`
+
+```powershell
+Install-WindowsFeature -Name Web-Server -IncludeManagementTools
+Set-Content -Path "C:\inetpub\wwwroot\index.html" -Value "<h1>Hello from Windows IIS</h1>"
+```
+
+```bash
+# RDP rule
+az network nsg rule create -g $RG --nsg-name $NSG -n allow-rdp --priority 1003 \
+  --access Allow --protocol Tcp --direction Inbound --destination-port-ranges 3389
+
+# Create Windows VM
+az vm create -g $RG -n $WIN_VM \
+  --image MicrosoftWindowsServer:WindowsServer:2022-datacenter:latest \
+  --size $WIN_SIZE \
+  --admin-username $ADMIN_USER \
+  --admin-password "$ADMIN_PASS" \
+  --nics $NIC \
+  --tags $TAGS
+
+# Custom Script Extension to install IIS
+az vm extension set -g $RG --vm-name $WIN_VM --name CustomScriptExtension \
+  --publisher Microsoft.Compute --version 1.10 \
+  --settings "{\"commandToExecute\":\"powershell -ExecutionPolicy Bypass -File win-init.ps1\"}" \
+  --protected-settings "{}"
+```
+
+### 3.2 PowerShell (Windows + IIS)
+
+```powershell
+$vmCfg = New-AzVMConfig -VMName $WinVm -VMSize $WinSz |
+  Set-AzVMOperatingSystem -Windows -ComputerName $WinVm -Credential $Cred |
+  Set-AzVMSourceImage -PublisherName "MicrosoftWindowsServer" -Offer "WindowsServer" -Skus "2022-datacenter" -Version "latest" |
+  Add-AzVMNetworkInterface -Id $nic.Id
+
+New-AzVM -ResourceGroupName $Rg -Location $Loc -VM $vmCfg -Tag $Tags
+
+Set-AzVMExtension -ResourceGroupName $Rg -VMName $WinVm -Name "CustomScriptExtension" `
+  -Publisher "Microsoft.Compute" -ExtensionType "CustomScriptExtension" -TypeHandlerVersion "1.10" `
+  -SettingString '{"commandToExecute":"powershell -ExecutionPolicy Bypass -File win-init.ps1"}'
+```
+
+### 3.3 Terraform (Windows + WinRM optional)
+
+```hcl
+resource "azurerm_windows_virtual_machine" "win" {
+  name                = "vm-win-01"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  size                = "Standard_B2ms"
+  admin_username      = "azureuser"
+  admin_password      = "P@ssw0rd-Your-Strong-Password-123!"
+  network_interface_ids = [azurerm_network_interface.nic.id]
+
+  source_image_reference {
+    publisher = "MicrosoftWindowsServer"
+    offer     = "WindowsServer"
+    sku       = "2022-datacenter"
+    version   = "latest"
+  }
+
+  os_disk {
+    name                 = "osdisk-win01"
+    caching              = "ReadWrite"
+    storage_account_type = "Premium_LRS"
+    disk_size_gb         = 128
+  }
+
+  tags = { env = "lab", project = "vm-lab", owner = "atul" }
+}
+
+# Custom Script Extension
+resource "azurerm_virtual_machine_extension" "iiscfg" {
+  name                 = "customscript"
+  virtual_machine_id   = azurerm_windows_virtual_machine.win.id
+  publisher            = "Microsoft.Compute"
+  type                 = "CustomScriptExtension"
+  type_handler_version = "1.10"
+  settings             = jsonencode({ commandToExecute = "powershell -ExecutionPolicy Bypass -File win-init.ps1" })
+}
+```
+
+---
+
+# 4) Useful VM **variants & options** (CLI snippets)
+
+### 4.1 Spot VM (Linux)
+
+```bash
+az vm create -g $RG -n vm-spot-ubuntu \
+  --image Ubuntu2204 --size Standard_B2s --priority Spot \
+  --max-price -1 --eviction-policy Deallocate \
+  --admin-username azureuser --ssh-key-values "$SSH_KEY"
+```
+
+### 4.2 Availability Set
+
+```bash
+az vm availability-set create -g $RG -n avset-app --platform-fault-domain-count 2
+az vm create -g $RG -n vm-avs-01 --image Ubuntu2204 --size Standard_B2s \
+  --availability-set avset-app --admin-username azureuser --ssh-key-values "$SSH_KEY"
+```
+
+### 4.3 Zone-pinned VM
+
+```bash
+az vm create -g $RG -n vm-zone-1 --image Ubuntu2204 --size Standard_B2s \
+  --zone 1 --admin-username azureuser --ssh-key-values "$SSH_KEY"
+```
+
+### 4.4 Ephemeral OS disk (fast boot, stateless)
+
+```bash
+az vm create -g $RG -n vm-ephemeral --image Ubuntu2204 --size Standard_D2s_v4 \
+  --ephemeral-os-disk true \
+  --admin-username azureuser --ssh-key-values "$SSH_KEY"
+```
+
+### 4.5 Accelerated Networking
+
+```bash
+az network nic update -g $RG -n $NIC --accelerated-networking true
+```
+
+### 4.6 Attach Data Disks
+
+```bash
+az vm disk attach -g $RG --vm-name $LINUX_VM --new --name data1 --size-gb 64
+```
+
+### 4.7 VM from **Shared Image Gallery** (SIG)
+
+```bash
+az vm create -g $RG -n vm-sig-01 \
+  --image "/subscriptions/<subid>/resourceGroups/<sigRG>/providers/Microsoft.Compute/galleries/<gallery>/images/<imageDef>/versions/1.0.0" \
+  --admin-username azureuser --ssh-key-values "$SSH_KEY"
+```
+
+### 4.8 Marketplace image requiring plan (example: Windows 11 Pro)
+
+```bash
+az vm image terms accept --publisher MicrosoftWindowsDesktop --offer windows-11 --plan win11-22h2-pro
+az vm create -g $RG -n vm-win11 \
+  --image MicrosoftWindowsDesktop:windows-11:win11-22h2-pro:latest \
+  --admin-username $ADMIN_USER --admin-password "$ADMIN_PASS"
+```
+
+### 4.9 System-assigned Managed Identity
+
+```bash
+az vm identity assign -g $RG -n $LINUX_VM
+```
+
+---
+
+# 5) **VM Scale Sets** (VMSS) quickstarts
+
+### 5.1 Linux VMSS with cloud-init
+
+`vmss-cloud-init.yaml`
+
+```yaml
+#cloud-config
+package_update: true
+packages: [nginx]
+runcmd:
+  - systemctl enable --now nginx
+```
+
+```bash
+az vmss create -g $RG -n vmss-nginx \
+  --image Ubuntu2204 --orchestration-mode Uniform \
+  --admin-username azureuser --ssh-key-values "$SSH_KEY" \
+  --instance-count 2 --upgrade-policy-mode Automatic \
+  --custom-data vmss-cloud-init.yaml
+```
+
+### 5.2 Windows VMSS with IIS
+
+```bash
+az vmss create -g $RG -n vmss-win-iis \
+  --image MicrosoftWindowsServer:WindowsServer:2022-datacenter:latest \
+  --admin-username $ADMIN_USER --admin-password "$ADMIN_PASS" \
+  --instance-count 2 --upgrade-policy-mode Automatic
+az vmss extension set -g $RG --vmss-name vmss-win-iis --name CustomScriptExtension \
+  --publisher Microsoft.Compute --version 1.10 \
+  --settings "{\"commandToExecute\":\"powershell -ExecutionPolicy Bypass Install-WindowsFeature Web-Server -IncludeManagementTools\"}"
+```
+
+---
+
+# 6) **Custom Script Extension** (Linux examples)
+
+### 6.1 Install Docker/Compose on Ubuntu
+
+`install-docker.sh`
+
+```bash
+#!/usr/bin/env bash
+set -e
+apt-get update -y
+apt-get install -y ca-certificates curl gnupg
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo $VERSION_CODENAME) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+apt-get update -y
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+usermod -aG docker azureuser
+systemctl enable --now docker
+```
+
+```bash
+az vm extension set -g $RG --vm-name $LINUX_VM --name CustomScript \
+  --publisher Microsoft.Azure.Extensions --version 2.1 \
+  --settings "{\"fileUris\":[\"https://<your-storage>/scripts/install-docker.sh\"],\"commandToExecute\":\"bash install-docker.sh\"}"
+```
+
+*(Tip: host `install-docker.sh` on Azure Storage with SAS; for quick test you can inline `commandToExecute` with a one-liner.)*
+
+---
+
+# 7) **Windows provisioning** helpers
+
+### 7.1 Enable WinRM over HTTPS (for configuration tools)
+
+```powershell
+# winrm-https.ps1
+winrm quickconfig -q
+New-SelfSignedCertificate -DnsName localhost -CertStoreLocation Cert:\LocalMachine\My | Out-Null
+Enable-PSRemoting -Force
+```
+
+### 7.2 Add local firewall rule (RDP already covered by NSG)
+
+```powershell
+New-NetFirewallRule -DisplayName "Allow HTTP 80" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 80
+```
+
+Apply via **CustomScriptExtension** just like the IIS sample.
+
+---
+
+# 8) **Security & best practices** (quick checklist)
+
+* Prefer **SSH keys** for Linux; store secrets in **Key Vault** (use `--admin-password` only for demos).
+* Lock down NSG source IPs (not `*`) for SSH/RDP in real environments.
+* Use **Managed Identities** + **Azure RBAC** for resource access (no embedded credentials).
+* For prod, consider **Azure Policy** to enforce approved SKUs/images, and **Defender for Cloud**.
+* Use **Availability Zones** or **VMSS** for HA; **Proximity Placement Groups** for low latency.
+* Consider **Ephemeral OS** for short-lived stateless workloads; **Ultra Disk** for high IOPS data disk.
+
+---
+
+# 9) Quick “destroy lab” commands (cleanup)
+
+### Azure CLI
+
+```bash
+az group delete -n $RG --yes --no-wait
+```
+
+### PowerShell
+
+```powershell
+Remove-AzResourceGroup -Name $Rg -Force
+```
+
+---
+
+## Want this as a ready-to-push repo?
+
+Say “create repo” and I’ll generate:
+
+* `/cli/` (Linux/Windows/VMSS scripts + cloud-init + PowerShell)
+* `/powershell/` (Az scripts)
+* `/bicep/` (main.bicep + param files)
+* `/arm/` (template.json + parameters.json)
+* `/terraform/` (main.tf + variables.tf + outputs.tf + README)
+* `/extensions/` (install-docker.sh, win-init.ps1, winrm-https.ps1)
+
+…and a README with step-by-step commands and screenshots checklists.
+
+
 That’s the **complete, production-grade list with working examples** for creating Azure VMs across all supported ways.
